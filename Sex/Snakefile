@@ -1,0 +1,786 @@
+############################################
+# WGS + sex-chromosome candidate detection
+# Samples: current run = GLT-02, GLT-03, GLT-04, GLT-06, GLT-07
+# Sex rule for full set: GLT-01..04 = male, GLT-05..07 = female
+############################################
+
+import os
+
+############################################
+# 0) User configuration
+############################################
+
+# 当前实际运行样本：2、3、4、6、7
+# 如果以后要跑 1-7 全部样本，改成：SAMPLE_IDS = ["01", "02", "03", "04", "05", "06", "07"]
+SAMPLE_IDS = ["02", "03", "04", "05", "06", "07"]
+samples = [f"GLT-{x}" for x in SAMPLE_IDS]
+
+# 你给定的性别信息：1-4 雄性，5-7 雌性
+ALL_MALE_IDS = ["01", "02", "03", "04"]
+ALL_FEMALE_IDS = ["05", "06", "07"]
+MALE_SAMPLES = [f"GLT-{x}" for x in ALL_MALE_IDS if f"GLT-{x}" in samples]
+FEMALE_SAMPLES = [f"GLT-{x}" for x in ALL_FEMALE_IDS if f"GLT-{x}" in samples]
+
+if len(MALE_SAMPLES) == 0 or len(FEMALE_SAMPLES) == 0:
+    raise ValueError(f"Need at least one male and one female sample. male={MALE_SAMPLES}, female={FEMALE_SAMPLES}")
+
+# Reference and bowtie2 index prefix
+genome = "./reference/wood_frog.fa"
+bt2_index = "./reference/wood_frog"   # bowtie2-build 前缀，不是 .bt2 文件名
+
+# Resources / environments
+THREADS_MAX = 200
+JAVA_MEM = "200G"
+ENV = "envs/wgs.yml"
+GATK_ENV = "gatk_env.yaml"
+
+# Mapping thread split: avoid bowtie2 and samtools sort both using 200 threads simultaneously
+BT2_THREADS = int(THREADS_MAX * 0.80)
+SORT_THREADS = max(1, THREADS_MAX - BT2_THREADS)
+
+# Sex chromosome analysis parameters
+SEX_OUTDIR = "sexchrom"
+WINDOW_SIZE = 100000
+MIN_SCAFFOLD = 10000
+MAPQ = 20
+BASEQ = 20
+MIN_GT_DP = 3
+
+# Optional: one scaffold/chromosome name per line. Leave empty to use all scaffolds >= MIN_SCAFFOLD.
+CHR_LIST = ""
+
+############################################
+# 1) Final targets
+############################################
+
+rule all:
+    input:
+        expand("markdup_bam/{sample}_markdup.bam", sample=samples),
+        expand("markdup_bam/{sample}_markdup.bam.csi", sample=samples),
+        f"{SEX_OUTDIR}/output/sex_chromosome_candidates.tsv",
+        f"{SEX_OUTDIR}/output/sex_chromosome_candidates.csv"
+
+############################################
+# 2) Reference index
+############################################
+
+rule Reference_faidx:
+    conda: ENV
+    input:
+        genome
+    output:
+        genome + ".fai"
+    threads: 1
+    shell:
+        """
+        samtools faidx {input}
+        """
+
+############################################
+# 3) QC / trimming
+############################################
+
+rule QC:
+    conda: ENV
+    input:
+        r1="raw_data/{sample}_R1.fq.gz",
+        r2="raw_data/{sample}_R2.fq.gz"
+    output:
+        r1="clean_fastq/{sample}_R1.fq.gz",
+        r2="clean_fastq/{sample}_R2.fq.gz"
+    threads: 16
+    log:
+        html="clean_fastq/{sample}.fastp.html",
+        json="clean_fastq/{sample}.fastp.json"
+    shell:
+        """
+        mkdir -p clean_fastq
+        fastp -w {threads} \
+          -i {input.r1} -I {input.r2} \
+          -o {output.r1} -O {output.r2} \
+          --detect_adapter_for_pe \
+          --html {log.html} --json {log.json}
+        """
+
+############################################
+# 4) Mapping: bowtie2 -> coordinate-sorted BAM
+############################################
+
+rule Bowtie2_map_sort:
+    conda: ENV
+    input:
+        r1="clean_fastq/{sample}_R1.fq.gz",
+        r2="clean_fastq/{sample}_R2.fq.gz"
+    output:
+        temp("sortedbam/{sample}.bam")
+    threads: THREADS_MAX
+    params:
+        bt2_threads=BT2_THREADS,
+        sort_threads=SORT_THREADS
+    log:
+        "logs/bowtie2/{sample}.log"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p sortedbam logs/bowtie2
+
+        bowtie2 -x {bt2_index} \
+          -1 {input.r1} -2 {input.r2} \
+          --rg-id {wildcards.sample} \
+          --rg SM:{wildcards.sample} \
+          --rg PL:ILLUMINA \
+          -p {params.bt2_threads} 2> {log} \
+        | samtools sort -@ {params.sort_threads} -o {output} -
+
+        samtools quickcheck -v {output}
+        """
+
+############################################
+# 5) Mark duplicates + CSI index
+############################################
+
+rule MarkDuplicates:
+    conda: GATK_ENV
+    input:
+        "sortedbam/{sample}.bam"
+    output:
+        bam="markdup_bam/{sample}_markdup.bam",
+        metrics="markdup_bam/{sample}.metrics.txt"
+    threads: 8
+    shell:
+        """
+        mkdir -p markdup_bam
+        gatk --java-options "-Xmx{JAVA_MEM}" MarkDuplicates \
+          -I {input} \
+          -O {output.bam} \
+          -M {output.metrics} \
+          --VALIDATION_STRINGENCY LENIENT \
+          --CREATE_INDEX false
+        """
+
+rule Index_markdup_bam:
+    conda: ENV
+    input:
+        bam="markdup_bam/{sample}_markdup.bam"
+    output:
+        csi="markdup_bam/{sample}_markdup.bam.csi"
+    threads: THREADS_MAX
+    shell:
+        """
+        samtools index -c -@ {threads} {input.bam} {output.csi}
+        """
+
+############################################
+# 6) Sex chromosome analysis: filter BAMs
+############################################
+
+rule SexFilterBam:
+    conda: ENV
+    input:
+        bam="markdup_bam/{sample}_markdup.bam",
+        csi="markdup_bam/{sample}_markdup.bam.csi"
+    output:
+        bam=f"{SEX_OUTDIR}/filtered/{{sample}}.filtered.bam",
+        csi=f"{SEX_OUTDIR}/filtered/{{sample}}.filtered.bam.csi"
+    threads: THREADS_MAX
+    params:
+        mapq=MAPQ
+    log:
+        f"{SEX_OUTDIR}/logs/filter/{{sample}}.log"
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {SEX_OUTDIR}/filtered {SEX_OUTDIR}/logs/filter
+
+        # -f 0x2: proper pair
+        # -F 3844: remove unmapped, secondary, QC-fail, duplicate, supplementary reads
+        samtools view -@ {threads} -b \
+          -q {params.mapq} \
+          -f 0x2 \
+          -F 3844 \
+          -o {output.bam} \
+          {input.bam} 2> {log}
+
+        samtools index -c -@ {threads} {output.bam} {output.csi}
+        samtools quickcheck -v {output.bam}
+        """
+
+############################################
+# 7) Make scaffold and window BED files
+############################################
+
+rule MakeWindows:
+    conda: ENV
+    input:
+        fai=genome + ".fai"
+    output:
+        filtered_fai=f"{SEX_OUTDIR}/coverage/ref_filtered.fai",
+        scaffolds_bed=f"{SEX_OUTDIR}/coverage/ref_filtered.scaffolds.bed",
+        windows_bed=f"{SEX_OUTDIR}/coverage/genome_{WINDOW_SIZE}bp_windows.bed"
+    params:
+        min_scaffold=MIN_SCAFFOLD,
+        window=WINDOW_SIZE,
+        chr_list=CHR_LIST
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {SEX_OUTDIR}/coverage
+
+        if [ -n "{params.chr_list}" ]; then
+            awk -v min="{params.min_scaffold}" 'BEGIN{{OFS="\t"}} FNR==NR && $1!="" {{keep[$1]=1; next}} $2>=min && ($1 in keep) {{print $0}}' \
+              "{params.chr_list}" {input.fai} > {output.filtered_fai}
+        else
+            awk -v min="{params.min_scaffold}" 'BEGIN{{OFS="\t"}} $2>=min {{print $0}}' \
+              {input.fai} > {output.filtered_fai}
+        fi
+
+        if [ ! -s {output.filtered_fai} ]; then
+            echo "ERROR: no scaffolds passed MIN_SCAFFOLD/CHR_LIST filters" >&2
+            exit 1
+        fi
+
+        awk 'BEGIN{{OFS="\t"}} {{print $1, 0, $2}}' {output.filtered_fai} > {output.scaffolds_bed}
+
+        bedtools makewindows -g {output.filtered_fai} -w {params.window} \
+          | awk -v ws="{params.window}" 'BEGIN{{OFS="\t"}} ($3-$2)==ws {{print $0}}' \
+          | bedtools sort > {output.windows_bed}
+        """
+
+############################################
+# 8) Window mean depth from BAMs using mosdepth
+############################################
+
+rule MosdepthWindowDepth:
+    conda: ENV
+    input:
+        bam=f"{SEX_OUTDIR}/filtered/{{sample}}.filtered.bam",
+        csi=f"{SEX_OUTDIR}/filtered/{{sample}}.filtered.bam.csi",
+        windows=f"{SEX_OUTDIR}/coverage/genome_{WINDOW_SIZE}bp_windows.bed"
+    output:
+        regions=f"{SEX_OUTDIR}/coverage/{{sample}}.mosdepth.regions.bed.gz"
+    threads: THREADS_MAX
+    params:
+        prefix=f"{SEX_OUTDIR}/coverage/{{sample}}.mosdepth",
+        mapq=MAPQ
+    log:
+        f"{SEX_OUTDIR}/logs/mosdepth/{{sample}}.log"
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {SEX_OUTDIR}/coverage {SEX_OUTDIR}/logs/mosdepth
+
+        mosdepth \
+          --threads {threads} \
+          --mapq {params.mapq} \
+          --no-per-base \
+          --by {input.windows} \
+          {params.prefix} \
+          {input.bam} > {log} 2>&1
+        """
+
+############################################
+# 9) Combine window depth and calculate male/female coverage ratios
+############################################
+
+rule CombineWindowDepth:
+    conda: ENV
+    input:
+        regions=expand(f"{SEX_OUTDIR}/coverage/{{sample}}.mosdepth.regions.bed.gz", sample=samples)
+    output:
+        depth=f"{SEX_OUTDIR}/coverage/window_depth_all_samples.tsv",
+        ratio=f"{SEX_OUTDIR}/coverage/window_ratio.tsv"
+    params:
+        sample_csv=",".join(samples),
+        male_csv=",".join(MALE_SAMPLES),
+        female_csv=",".join(FEMALE_SAMPLES),
+        eps=0.05
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {SEX_OUTDIR}/coverage
+
+        python3 - \
+          "{params.sample_csv}" \
+          "{params.male_csv}" \
+          "{params.female_csv}" \
+          "{output.depth}" \
+          "{output.ratio}" \
+          "{params.eps}" \
+          {input.regions} <<'PYEOF'
+import sys
+import gzip
+import math
+import numpy as np
+
+samples = [x for x in sys.argv[1].split(',') if x]
+male_samples = [x for x in sys.argv[2].split(',') if x]
+female_samples = [x for x in sys.argv[3].split(',') if x]
+out_depth = sys.argv[4]
+out_ratio = sys.argv[5]
+eps = float(sys.argv[6])
+paths = sys.argv[7:]
+
+if len(paths) != len(samples):
+    raise SystemExit(f"ERROR: sample/path number mismatch: {len(samples)} samples vs {len(paths)} files")
+
+windows = None
+raw = {}
+medians = {}
+
+for sample, path in zip(samples, paths):
+    vals = []
+    wins = []
+    with gzip.open(path, 'rt') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            p = line.rstrip('\n').split('\t')
+            chrom, start, end = p[0], int(p[1]), int(p[2])
+            depth = float(p[3])
+            wins.append((chrom, start, end))
+            vals.append(depth)
+    if windows is None:
+        windows = wins
+    elif wins != windows:
+        raise SystemExit(f"ERROR: window order differs for {sample}; check mosdepth outputs")
+    arr = np.array(vals, dtype=float)
+    raw[sample] = arr
+    positive = arr[arr > 0]
+    medians[sample] = float(np.median(positive)) if positive.size else 1.0
+    if medians[sample] <= 0:
+        medians[sample] = 1.0
+
+norm = {s: raw[s] / medians[s] for s in samples}
+
+with open(out_depth, 'w') as out:
+    out.write('chr\tstart\tend\t' + '\t'.join([f'{s}_depth' for s in samples]) + '\n')
+    for i, (chrom, start, end) in enumerate(windows):
+        out.write(f'{chrom}\t{start}\t{end}\t' + '\t'.join(f'{raw[s][i]:.6f}' for s in samples) + '\n')
+
+with open(out_ratio, 'w') as out:
+    out.write('chr\tstart\tend\t'
+              'male_mean_depth\tmale_sd_depth\tfemale_mean_depth\tfemale_sd_depth\t'
+              'male_mean_norm\tmale_sd_norm\tfemale_mean_norm\tfemale_sd_norm\t'
+              'ratio_M_F_norm\tlog2_ratio_M_F_norm\tn_male\tn_female\n')
+    for i, (chrom, start, end) in enumerate(windows):
+        m_raw = np.array([raw[s][i] for s in male_samples], dtype=float)
+        f_raw = np.array([raw[s][i] for s in female_samples], dtype=float)
+        m_norm = np.array([norm[s][i] for s in male_samples], dtype=float)
+        f_norm = np.array([norm[s][i] for s in female_samples], dtype=float)
+
+        male_mean_depth = float(np.mean(m_raw))
+        female_mean_depth = float(np.mean(f_raw))
+        male_sd_depth = float(np.std(m_raw)) if len(m_raw) > 1 else 0.0
+        female_sd_depth = float(np.std(f_raw)) if len(f_raw) > 1 else 0.0
+
+        male_mean_norm = float(np.mean(m_norm))
+        female_mean_norm = float(np.mean(f_norm))
+        male_sd_norm = float(np.std(m_norm)) if len(m_norm) > 1 else 0.0
+        female_sd_norm = float(np.std(f_norm)) if len(f_norm) > 1 else 0.0
+
+        ratio = (male_mean_norm + eps) / (female_mean_norm + eps)
+        log2r = math.log2(ratio) if ratio > 0 else float('nan')
+
+        out.write(f'{chrom}\t{start}\t{end}\t'
+                  f'{male_mean_depth:.6f}\t{male_sd_depth:.6f}\t{female_mean_depth:.6f}\t{female_sd_depth:.6f}\t'
+                  f'{male_mean_norm:.6f}\t{male_sd_norm:.6f}\t{female_mean_norm:.6f}\t{female_sd_norm:.6f}\t'
+                  f'{ratio:.6f}\t{log2r:.6f}\t{len(male_samples)}\t{len(female_samples)}\n')
+PYEOF
+        """
+
+############################################
+# 10) Joint variant calling on filtered BAMs
+############################################
+
+rule JointVariants:
+    conda: ENV
+    input:
+        ref=genome,
+        fai=genome + ".fai",
+        regions=f"{SEX_OUTDIR}/coverage/ref_filtered.scaffolds.bed",
+        bams=expand(f"{SEX_OUTDIR}/filtered/{{sample}}.filtered.bam", sample=samples),
+        idxs=expand(f"{SEX_OUTDIR}/filtered/{{sample}}.filtered.bam.csi", sample=samples)
+    output:
+        vcf=f"{SEX_OUTDIR}/variants/joint.vcf.gz",
+        csi=f"{SEX_OUTDIR}/variants/joint.vcf.gz.csi"
+    threads: THREADS_MAX
+    params:
+        mapq=MAPQ,
+        baseq=BASEQ,
+        bams=" ".join(expand(f"{SEX_OUTDIR}/filtered/{{sample}}.filtered.bam", sample=samples))
+    log:
+        f"{SEX_OUTDIR}/logs/bcftools_joint.log"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {SEX_OUTDIR}/variants {SEX_OUTDIR}/logs
+
+        bcftools mpileup \
+          --threads {threads} \
+          -q {params.mapq} \
+          -Q {params.baseq} \
+          -a FORMAT/DP \
+          -f {input.ref} \
+          -R {input.regions} \
+          {params.bams} \
+          -Ou 2> {log} \
+        | bcftools call \
+          --threads {threads} \
+          -m -v \
+          -Ou 2>> {log} \
+        | bcftools filter \
+          -i 'QUAL>=20 && INFO/DP>=3' \
+          -Oz -o {output.vcf} 2>> {log}
+
+        bcftools index --csi --threads {threads} {output.vcf}
+        """
+
+############################################
+# 11) Heterozygosity per scaffold, averaged per individual within sex
+############################################
+
+rule HeterozygosityByScaffold:
+    conda: ENV
+    input:
+        vcf=f"{SEX_OUTDIR}/variants/joint.vcf.gz",
+        csi=f"{SEX_OUTDIR}/variants/joint.vcf.gz.csi",
+        fai=genome + ".fai"
+    output:
+        het=f"{SEX_OUTDIR}/variants/heterozygosity_by_scaffold.tsv"
+    params:
+        male_csv=",".join(MALE_SAMPLES),
+        female_csv=",".join(FEMALE_SAMPLES),
+        min_scaffold=MIN_SCAFFOLD,
+        min_gt_dp=MIN_GT_DP,
+        chr_list=CHR_LIST
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {SEX_OUTDIR}/variants
+
+        python3 - \
+          "{input.vcf}" \
+          "{input.fai}" \
+          "{output.het}" \
+          "{params.male_csv}" \
+          "{params.female_csv}" \
+          "{params.min_scaffold}" \
+          "{params.min_gt_dp}" \
+          "{params.chr_list}" <<'PYEOF'
+import sys
+import gzip
+import collections
+import numpy as np
+
+vcf_file = sys.argv[1]
+fai_file = sys.argv[2]
+out_file = sys.argv[3]
+male_samples = [x for x in sys.argv[4].split(',') if x]
+female_samples = [x for x in sys.argv[5].split(',') if x]
+min_scaffold = int(sys.argv[6])
+min_gt_dp = int(sys.argv[7])
+chr_list = sys.argv[8]
+
+allowed = None
+if chr_list:
+    allowed = set()
+    with open(chr_list) as f:
+        for line in f:
+            x = line.strip().split()
+            if x:
+                allowed.add(x[0])
+
+scaffold_len = {}
+with open(fai_file) as f:
+    for line in f:
+        p = line.rstrip('\n').split('\t')
+        chrom, length = p[0], int(p[1])
+        if length >= min_scaffold and (allowed is None or chrom in allowed):
+            scaffold_len[chrom] = length
+
+all_samples = male_samples + female_samples
+sample_to_idx = {}
+counts = collections.defaultdict(lambda: collections.defaultdict(lambda: {'called': 0, 'het': 0}))
+
+
+def gt_is_het(gt):
+    gt = gt.replace('|', '/')
+    if gt in ('.', './.'):
+        return None
+    alleles = gt.split('/')
+    if any(a == '.' for a in alleles):
+        return None
+    return len(set(alleles)) > 1
+
+opener = gzip.open if vcf_file.endswith('.gz') else open
+with opener(vcf_file, 'rt') as f:
+    for line in f:
+        if line.startswith('##'):
+            continue
+        if line.startswith('#CHROM'):
+            header = line.rstrip('\n').split('\t')
+            vcf_samples = header[9:]
+            for s in all_samples:
+                if s not in vcf_samples:
+                    raise SystemExit(f"ERROR: sample {s} not found in VCF header. VCF samples: {','.join(vcf_samples)}")
+                sample_to_idx[s] = 9 + vcf_samples.index(s)
+            continue
+
+        p = line.rstrip('\n').split('\t')
+        chrom = p[0]
+        if chrom not in scaffold_len:
+            continue
+
+        fmt = p[8].split(':')
+        dp_i = fmt.index('DP') if 'DP' in fmt else None
+
+        for s in all_samples:
+            field = p[sample_to_idx[s]].split(':')
+            gt = field[0]
+            het = gt_is_het(gt)
+            if het is None:
+                continue
+            if dp_i is not None:
+                try:
+                    dp = int(field[dp_i])
+                except Exception:
+                    continue
+                if dp < min_gt_dp:
+                    continue
+            counts[chrom][s]['called'] += 1
+            if het:
+                counts[chrom][s]['het'] += 1
+
+with open(out_file, 'w') as out:
+    out.write('chr\tscaffold_length\tmale_het_rate\tfemale_het_rate\thet_diff_F_minus_M\t'
+              'male_called_genotypes\tfemale_called_genotypes\tmale_het_genotypes\tfemale_het_genotypes\t'
+              'n_male_samples\tn_female_samples\n')
+    for chrom in sorted(scaffold_len):
+        male_rates = []
+        female_rates = []
+        m_called = f_called = m_het = f_het = 0
+
+        for s in male_samples:
+            c = counts[chrom][s]['called']
+            h = counts[chrom][s]['het']
+            m_called += c
+            m_het += h
+            if c > 0:
+                male_rates.append(h / c)
+
+        for s in female_samples:
+            c = counts[chrom][s]['called']
+            h = counts[chrom][s]['het']
+            f_called += c
+            f_het += h
+            if c > 0:
+                female_rates.append(h / c)
+
+        m_rate = float(np.mean(male_rates)) if male_rates else 0.0
+        f_rate = float(np.mean(female_rates)) if female_rates else 0.0
+        out.write(f'{chrom}\t{scaffold_len[chrom]}\t{m_rate:.8f}\t{f_rate:.8f}\t{(f_rate-m_rate):.8f}\t'
+                  f'{m_called}\t{f_called}\t{m_het}\t{f_het}\t{len(male_samples)}\t{len(female_samples)}\n')
+PYEOF
+        """
+
+############################################
+# 12) Integrate coverage + heterozygosity and classify candidates
+############################################
+
+rule IntegrateSexChromosomeSignals:
+    conda: ENV
+    input:
+        ratio=f"{SEX_OUTDIR}/coverage/window_ratio.tsv",
+        het=f"{SEX_OUTDIR}/variants/heterozygosity_by_scaffold.tsv"
+    output:
+        tsv=f"{SEX_OUTDIR}/output/sex_chromosome_candidates.tsv",
+        csv=f"{SEX_OUTDIR}/output/sex_chromosome_candidates.csv"
+    params:
+        n_male=len(MALE_SAMPLES),
+        n_female=len(FEMALE_SAMPLES)
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {SEX_OUTDIR}/output
+
+        python3 - \
+          "{input.ratio}" \
+          "{input.het}" \
+          "{output.tsv}" \
+          "{output.csv}" \
+          "{params.n_male}" \
+          "{params.n_female}" <<'PYEOF'
+import sys
+import csv
+import math
+import collections
+import numpy as np
+
+ratio_file = sys.argv[1]
+het_file = sys.argv[2]
+out_tsv = sys.argv[3]
+out_csv = sys.argv[4]
+n_male = int(sys.argv[5])
+n_female = int(sys.argv[6])
+
+cov = collections.defaultdict(lambda: {
+    'male_depth': [], 'female_depth': [],
+    'male_norm': [], 'female_norm': [],
+    'ratio': [], 'log2': []
+})
+
+with open(ratio_file) as f:
+    reader = csv.DictReader(f, delimiter='\t')
+    for r in reader:
+        chrom = r['chr']
+        cov[chrom]['male_depth'].append(float(r['male_mean_depth']))
+        cov[chrom]['female_depth'].append(float(r['female_mean_depth']))
+        cov[chrom]['male_norm'].append(float(r['male_mean_norm']))
+        cov[chrom]['female_norm'].append(float(r['female_mean_norm']))
+        cov[chrom]['ratio'].append(float(r['ratio_M_F_norm']))
+        cov[chrom]['log2'].append(float(r['log2_ratio_M_F_norm']))
+
+het = {}
+with open(het_file) as f:
+    reader = csv.DictReader(f, delimiter='\t')
+    for r in reader:
+        het[r['chr']] = {
+            'length': int(r['scaffold_length']),
+            'male_het_rate': float(r['male_het_rate']),
+            'female_het_rate': float(r['female_het_rate']),
+            'het_diff_F_minus_M': float(r['het_diff_F_minus_M']),
+            'male_called_genotypes': int(r['male_called_genotypes']),
+            'female_called_genotypes': int(r['female_called_genotypes']),
+            'male_het_genotypes': int(r['male_het_genotypes']),
+            'female_het_genotypes': int(r['female_het_genotypes']),
+        }
+
+rows = []
+for chrom, c in cov.items():
+    if chrom not in het:
+        continue
+
+    log2_vals = np.array(c['log2'], dtype=float)
+    ratio_vals = np.array(c['ratio'], dtype=float)
+    log2_vals = log2_vals[np.isfinite(log2_vals)]
+    ratio_vals = ratio_vals[np.isfinite(ratio_vals)]
+    if log2_vals.size == 0 or ratio_vals.size == 0:
+        continue
+
+    median_log2 = float(np.median(log2_vals))
+    mean_log2 = float(np.mean(log2_vals))
+    sd_log2 = float(np.std(log2_vals))
+    median_ratio = float(np.median(ratio_vals))
+
+    male_depth = float(np.mean(c['male_depth']))
+    female_depth = float(np.mean(c['female_depth']))
+    male_norm = float(np.mean(c['male_norm']))
+    female_norm = float(np.mean(c['female_norm']))
+
+    h = het[chrom]
+    mhet = h['male_het_rate']
+    fhet = h['female_het_rate']
+    het_diff = h['het_diff_F_minus_M']
+
+    # Scores. Autosomes are expected near log2(M/F)=0 and het_diff=0.
+    # XY system:
+    #   X: male normalized depth ~0.5, female ~1.0, female het > male het
+    #   Y: male-only or male-enriched depth, female depth near 0
+    xy_x_score = max(0.0, -median_log2) + max(0.0, het_diff) * 10.0
+    xy_y_score = max(0.0, median_log2 - 1.0) + max(0.0, 0.20 - female_norm) * 5.0
+
+    # ZW system, included as a safeguard if the species is female-heterogametic:
+    #   Z: male normalized depth ~1.0, female ~0.5, male het > female het
+    #   W: female-only or female-enriched depth, male depth near 0
+    zw_z_score = max(0.0, median_log2) + max(0.0, -het_diff) * 10.0
+    zw_w_score = max(0.0, -median_log2 - 1.0) + max(0.0, 0.20 - male_norm) * 5.0
+
+    auto_deviation = abs(median_log2)
+    called_genotypes = h['male_called_genotypes'] + h['female_called_genotypes']
+    n_windows = len(c['log2'])
+
+    prediction = 'autosomal_like'
+    model = 'none'
+    confidence = max(0.0, min(0.99, 1.0 - auto_deviation))
+
+    if female_norm < 0.20 and male_norm > 0.20 and median_log2 > 1.0:
+        prediction = 'XY_Y_candidate'
+        model = 'XY_male_heterogametic'
+        confidence = min(0.99, xy_y_score / (xy_y_score + 1.0))
+    elif male_norm < 0.20 and female_norm > 0.20 and median_log2 < -1.0:
+        prediction = 'ZW_W_candidate'
+        model = 'ZW_female_heterogametic'
+        confidence = min(0.99, zw_w_score / (zw_w_score + 1.0))
+    elif median_ratio < 0.75 and het_diff > 0:
+        prediction = 'XY_X_candidate'
+        model = 'XY_male_heterogametic'
+        confidence = min(0.99, xy_x_score / (xy_x_score + 1.5))
+    elif median_ratio > 1.33 and het_diff < 0:
+        prediction = 'ZW_Z_candidate'
+        model = 'ZW_female_heterogametic'
+        confidence = min(0.99, zw_z_score / (zw_z_score + 1.5))
+    elif auto_deviation >= 0.50:
+        prediction = 'coverage_deviant_candidate'
+        model = 'unknown'
+        confidence = min(0.85, auto_deviation / 2.0)
+
+    rows.append({
+        'chr': chrom,
+        'scaffold_length': h['length'],
+        'mean_male_depth': male_depth,
+        'mean_female_depth': female_depth,
+        'mean_male_norm_depth': male_norm,
+        'mean_female_norm_depth': female_norm,
+        'median_M_F_norm_ratio': median_ratio,
+        'median_log2_M_F_norm_ratio': median_log2,
+        'mean_log2_M_F_norm_ratio': mean_log2,
+        'sd_log2_M_F_norm_ratio': sd_log2,
+        'male_het_rate': mhet,
+        'female_het_rate': fhet,
+        'het_diff_F_minus_M': het_diff,
+        'called_genotypes': called_genotypes,
+        'n_windows': n_windows,
+        'xy_x_score': xy_x_score,
+        'xy_y_score': xy_y_score,
+        'zw_z_score': zw_z_score,
+        'zw_w_score': zw_w_score,
+        'auto_deviation': auto_deviation,
+        'prediction': prediction,
+        'model': model,
+        'confidence': confidence,
+        'n_male_samples': n_male,
+        'n_female_samples': n_female,
+    })
+
+rows.sort(key=lambda r: (r['prediction'] == 'autosomal_like', -r['confidence'], -r['auto_deviation'], -r['scaffold_length']))
+
+fieldnames = [
+    'chr', 'scaffold_length',
+    'mean_male_depth', 'mean_female_depth',
+    'mean_male_norm_depth', 'mean_female_norm_depth',
+    'median_M_F_norm_ratio', 'median_log2_M_F_norm_ratio',
+    'mean_log2_M_F_norm_ratio', 'sd_log2_M_F_norm_ratio',
+    'male_het_rate', 'female_het_rate', 'het_diff_F_minus_M',
+    'called_genotypes', 'n_windows',
+    'xy_x_score', 'xy_y_score', 'zw_z_score', 'zw_w_score',
+    'auto_deviation', 'prediction', 'model', 'confidence',
+    'n_male_samples', 'n_female_samples'
+]
+
+with open(out_tsv, 'w', newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+
+with open(out_csv, 'w', newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+
+print(f"Total scaffolds analyzed: {len(rows)}")
+print(f"Male samples: {n_male}; female samples: {n_female}")
+print(f"Results written to: {out_tsv}")
+PYEOF
+        """
